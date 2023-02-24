@@ -1,3 +1,23 @@
+# Touch Advanced Usermod for WLED
+
+Provides esp32 touch functionality with auto calibration, pin-specific settings and extended functionality.
+
+### Currently there are five button modes:
+
+* Digital Button (Mode 1 - 127) - up to 127 actions per button, including dimming on long touch
+* Analog Value (Mode 131) - when touched, sets an analog value depending on touch strength
+* Analog Weighted (Mode 141) - when touched, sets a fixed analog value, multiple such buttons are weighted depending on touch strength, can be used for (absolute) sliders
+* Analog Wheel (Mode 151) - when touched, provides an angle, multiple such buttons are combined depending their touch strength, finger movement allows to scroll a virtual wheel, can be used for virtual knobs, wheels
+* Digital Switch (Mode 171) - similar to button, but has 2 stable states and toggle actions
+
+The usermod is still under development, settings might change, expect bugs.
+
+Bug reports and feature requests: https://github.com/bernis/WLED
+
+# [Full usermod README here](usermods/touch_advanced/readme.md)
+
+# Original WLED README below
+
 <p align="center">
   <img src="/images/wled_logo_akemi.png">
   <a href="https://github.com/Aircoookie/WLED/releases"><img src="https://img.shields.io/github/release/Aircoookie/WLED.svg?style=flat-square"></a>
