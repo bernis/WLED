@@ -200,6 +200,9 @@
 #ifdef USERMOD_TOUCHADVANCED
   #include "../usermods/touch_advanced/usermod_v2_touchadvanced.h"
 #endif
+#ifdef USERMOD_TOUCHADVANCED
+  #include "../usermods/touch_advanced/usermod_v2_touchadvanced.h"
+#endif
 
 void registerUsermods()
 {
