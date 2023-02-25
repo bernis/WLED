@@ -1,6 +1,9 @@
 # Touch Advanced Usermod for WLED
 
 Provides esp32 touch functionality with auto calibration, pin-specific settings and extended functionality.
+<p align="center">
+  <img src="/usermods/touch_advanced/screenshot.png">
+</p>
 
 ### Currently there are five button modes:
 
