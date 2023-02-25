@@ -185,6 +185,9 @@
 #include "../usermods/pwm_outputs/usermod_pwm_outputs.h"
 #endif
 
+#ifdef USERMOD_TOUCHADVANCED
+  #include "../usermods/touch_advanced/usermod_v2_touchadvanced.h"
+#endif
 
 void registerUsermods()
 {
@@ -348,5 +351,9 @@ void registerUsermods()
 
   #ifdef USERMOD_SHT
   usermods.add(new ShtUsermod());
+  #endif
+
+  #ifdef USERMOD_TOUCHADVANCED
+  usermods.add(new TouchAdvancedUsermod());
   #endif
 }
