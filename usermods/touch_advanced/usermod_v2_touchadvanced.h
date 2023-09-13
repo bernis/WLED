@@ -254,7 +254,7 @@ class TouchAdvancedUsermod : public Usermod {
 
     void calibration() {
 
-      #ifdef TOUCHADV_CALIBRATE_PWM;
+      #ifdef TOUCHADV_CALIBRATE_PWM
       //busses 
       //  getNumBusses
       //each bus
