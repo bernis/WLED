@@ -3,16 +3,23 @@
 #include "wled.h"
 
 // extra settings
-#define TOUCHADV_NUM_ACTIONS 6
-#define TOUCHADV_NUM_PINS    4
+#ifndef TOUCHADV_NUM_ACTIONS
+  #define TOUCHADV_NUM_ACTIONS 6
+#endif
+
+#ifndef TOUCHADV_NUM_PINS
+  #define TOUCHADV_NUM_PINS    4
+#endif
 
 #define TOUCHADV_WHEEL_HAS_ENDSTOP 1 // 1 or 0
 #define TOUCHADV_WHEEL_FRICTION    0.02f
 #define TOUCHADV_WHEEL_VALUEUPDOWN 0 // 1 or 0
 
+//#define TOUCHADV_CALIBRATE_PWM # not implemented
+
 // debug switches
-#define TOUCHADV_DEBUG_VALUES
-#define TOUCHADV_DEBUG_TRANSITION
+//#define TOUCHADV_DEBUG_VALUES
+//#define TOUCHADV_DEBUG_TRANSITION
 //#define TOUCHADV_DEBUG_ANALOG_VALUE
 //#define TOUCHADV_DEBUG_WHEEL
 
@@ -38,20 +45,21 @@ class TouchAdvancedUsermod : public Usermod {
     static const uint8_t pins = TOUCHADV_NUM_PINS;
     static const uint8_t actions = TOUCHADV_NUM_ACTIONS;
     static const uint8_t analogBufferLen = 4;     // to restore 300-400ms old analog value after lift
+    static const uint8_t bufferLen = 6;           // for the median filter
     const uint8_t millisUpdate = 10;              // update time in ms
-    const uint16_t calibrationSamples = 500;      // 10s total calibration time
+    const uint16_t calibrationSamples = 100;      // 10s total calibration time
     const bool enableAdaptiveLongTouch = false;   // does not seem to improve things much
     
-    const uint16_t hw_measure_cycles = 0xffff;    // 8.5MHz fast RC clock -> 7.71ms
-    const uint16_t hw_sleep_cycles =   0x0040;    // 125kHz slow RC clock -> 0.512ms
+    const uint16_t hw_measure_cycles = 0xffff;    // ~8.5MHz fast RC clock -> ~7.7ms
+    const uint16_t hw_sleep_cycles =   0x0040;    // ~150kHz slow RC clock -> ~0.5ms
 
     // settings
-    bool enabled = true;
-    uint8_t guard = 5;                            // minCap in standard deviations
-    uint8_t debounceLen = 5;                      // in update cycles
-    uint16_t millisLongTouch = 400;               // touch timeout in ms
-    bool updateMean = true;
-    bool updateVariance = true;
+    bool      enabled               = true;
+    uint8_t   guard                 = 5;          // minCap in standard deviations
+    uint8_t   debounceLen           = 5;          // in update cycles
+    uint16_t  millisLongTouch       = 400;        // touch timeout in ms
+    bool      updateMean            = true;
+    bool      updateVariance        = true;
 
     // settings per pin
     int8_t    pin[pins]             = {-1};       // should maybe be named gpio maybe
@@ -76,8 +84,11 @@ class TouchAdvancedUsermod : public Usermod {
     bool      initDone            = false;
  
     // state variables per pin
+    float     capLast[pins]       = {0};        // last cap, for mean reset, web interface
+    uint8_t   bufferPos[pins]     = {0};
+    float     buffer[pins][bufferLen] = {{0}};  // value buffer for fir filter
     uint16_t  millisTouch[pins]   = {0};
-    uint8_t   state[pins]         = {0};
+    uint8_t   state[pins]         = {0};        // even-untouched, odd-touched
     int8_t    debounce[pins]      = {0};
 
     // state variables: analog
@@ -121,10 +132,25 @@ class TouchAdvancedUsermod : public Usermod {
 
     void touchInit() {
       touch_pad_init();
-      // around 4 extra clocks per cycle and pF with this settings
+      // around 4 extra clocks per cycle and pF with these settings
+      // (dis)charging current:     I ~= 8.5uA @ slope7   (default, value measured)
+      // fast RC oscillator         f ~= 8.5MHz           (nominal, can be 8-9MHz)
+      // measurement clocks:        cm = 65535
+      // measurement time:          tm = cm / f = 7.71ms  (~7.3ms measured)
+      // charge cycle time:         tc = tm / touchRead()
+      // charge per cycle:          dQ = I * tc
+      // voltage change per cycle:  dV = 4.4V (0.5V->2.7V->0.5V)
+      //
+      // measured cap in SI units As/V (F): 
+      //   C_SI = dQ/dV = I * tc / dV = 8.5uA * 65535 / 8.5Mhz / touchRead() / 4.4V 
+      //        = 14894pF / touchRead()
+      // measured cap in clocks: (TA uses this)
+      //   C_TA = dQ/dV 
+      //        = 65535 / touchRead()
+      //
+      // conversion factor between SI and clocks:
+      //   C_SI/C_TA = 8.5uA / 8.5Mhz / 4.4V = 227fF (per clock)
       touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5, TOUCH_HVOLT_ATTEN_0V);
-      // more cycles, around 3 extra clocks per cycle and pF with this settings
-      // touch_pad_set_voltage(TOUCH_HVOLT_2V4, TOUCH_LVOLT_0V8, TOUCH_HVOLT_ATTEN_0V);
       touch_pad_set_meas_time(hw_sleep_cycles, hw_measure_cycles);
       touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER);
       touch_pad_filter_start(millisUpdate/3);
@@ -159,18 +185,90 @@ class TouchAdvancedUsermod : public Usermod {
       pinManager.deallocatePin(pin, PinOwner::UM_Unspecified);
     }
 
-    float touchPinMeasure(int8_t pin) {
-      int8_t touchChannel = digitalPinToTouchChannel(pin);
-      if (touchChannel == -1) 
-        return 150-50*digitalRead(pin);
-            
-      uint16_t raw = 0;
-      touch_pad_read_filtered((touch_pad_t)touchChannel, &raw);
-      // first cycle takes about 1/9 longer (+0.111),  partial last cycle not counted
-      return hw_measure_cycles / (raw+0.111f+(random(63)/64.0f));
+    float touchPinMeasure(uint8_t p, bool filtered) {
+      int8_t touchChannel = digitalPinToTouchChannel(pin[p]);
+
+      if (touchChannel == -1) {
+        // no real touch channel, report fake values 100/150
+        capLast[p] = 150-50*digitalRead(pin[p]);
+      } else {
+        uint16_t raw;
+        float corr, val;
+        touch_pad_read_raw_data((touch_pad_t)touchChannel, &raw);
+        corr = raw;
+
+        #if 0
+        //testing pwm correction
+        if (p == 6 && pin[p] == 32) {// right
+          corr += 7.0f * (R(busses.getPixelColor(70)))/255.0f;
+          //Serial.println(busses.getPixelColor(70));
+        }
+
+        if (p == 9 && pin[p] == 13) {// left
+          corr += 8.0f * (R(busses.getPixelColor(71)))/255.0f;
+          //Serial.println(busses.getPixelColor(71));
+        }
+        #endif
+
+        // median filter, length 7 hardcoded atm
+        // filters up to three bad values, causes 30ms input delay,
+        // affects input behaviour, minimum 40ms touch/release required
+        if (filtered) {
+          float sort[bufferLen+1], swap;
+          memcpy(sort, buffer[p], sizeof(buffer[p]));
+          sort[bufferLen] = corr;
+
+          for (uint8_t i=1; i<(bufferLen+1); i++) {
+            for (uint8_t j=i; j>0 && sort[j-1] > sort[j]; j--) {
+              swap = sort[i]; sort[i] = sort[j]; sort[j] = swap;
+            }
+          }
+          
+          //val = sort[bufferLen/2];
+          
+          uint8_t cnt=0;
+          val = 0;
+          for (uint8_t i=0; i<(bufferLen+1); i++) {
+            // med +- 2
+            if ( fabsf(sort[i] - sort[bufferLen/2]) <= 3.0f ) {
+              val += sort[i];
+              cnt++;
+            }
+          }
+          val /= cnt;
+        } else {
+          val = corr;
+        }
+
+        // update buffer
+        buffer[p][bufferPos[p]] = corr;
+        bufferPos[p]++;
+        bufferPos[p] %= bufferLen;
+
+        // first cycle takes longer (0.0-2.7-0.5 vs 0.5-2.7-0.5 -> 1.114)
+        // partial last cycle not counted (-> 0.5)
+        capLast[p] = hw_measure_cycles / (val+0.114f+0.5f);
+      }
+      return capLast[p];
     }
 
     void calibration() {
+
+      #ifdef TOUCHADV_CALIBRATE_PWM;
+      //busses 
+      //  getNumBusses
+      //each bus
+      //  getType == TYPE_ANALOG_1CH, etc TYPE_ONOFF
+      //
+      for (uint8_t i; i<busses.getNumBusses(); i++)
+      {
+        switch busses.getBus(i)->getType() {
+          case TYPE_ANALOG_1CH:
+
+        }
+        
+      }
+      #endif
 
       if (calibrationSample == calibrationSamples) {
         calibrationStep++;
@@ -188,7 +286,7 @@ class TouchAdvancedUsermod : public Usermod {
 
         // step 1: collect data
         if (calibrationStep == 1) {
-          float cap = touchPinMeasure(pin[p]);
+          float cap = touchPinMeasure(p, false);
           if (!calibrationSample) 
             calK[p] = cap;
           capMean[p]   += (cap-calK[p]); // avoid floating point issues
@@ -215,7 +313,7 @@ class TouchAdvancedUsermod : public Usermod {
       // sweeps analog value in special long press actions > 200
       // action[i-1] = action to perform in state i
 
-      if (!state[p] || state[p]==255)
+      if (!state[p])
         return;
 
       // timeout or final state triggers action: apply preset or move on to dim state
@@ -233,8 +331,8 @@ class TouchAdvancedUsermod : public Usermod {
       }
 
       // special dim state
-      if (state[p] > 128) {
-        int16_t value = 127 + 150 * sin(millisTouch[p]/1000.0);
+      if (state[p] > 128 && state[p] != 255) {
+        int16_t value = 127 + 150 * sinf(millisTouch[p]/2000.0f);
         value = max((int16_t)1  , value);
         value = min((int16_t)255, value);
 
@@ -243,6 +341,9 @@ class TouchAdvancedUsermod : public Usermod {
         analogTotalWeight = 255;
         analogBufferUse = 0;
       }
+
+      if (state[p] == 255 && millisTouch[p] > 3000) // pad cap changed
+        capMean[p] = capLast[p];                        // up mean
     }
 
     void updateDigitalSwitch(uint8_t p, bool transition, bool longTouch) {
@@ -489,6 +590,7 @@ class TouchAdvancedUsermod : public Usermod {
       uint8_t* current = 0;
       uint8_t action = analogAction;
       if (action == TOUCHADV_ACTION_META)       action = analogMeta;
+      if (action > 200 && action <= 216)        current = &(strip.getSegment(action-200).opacity);
       if (action == TOUCHADV_ACTION_BRIGHTNESS) current = &bri;
       if (action == TOUCHADV_ACTION_SPEED)      current = &effectSpeed;
       if (action == TOUCHADV_ACTION_INTENSITY)  current = &effectIntensity;
@@ -523,7 +625,7 @@ class TouchAdvancedUsermod : public Usermod {
         if (pin[p] == -1 || !pinModex[p]) continue;
 
         // read
-        float cap      = touchPinMeasure(pin[p]);   // total capacitance in hw_cycles (equal to about 0.25pF)
+        float cap      = touchPinMeasure(p, true);   // total capacitance in hw_cycles (equal to about 0.25pF)
         float capDelta = pinNoMean[p] ? cap          : cap-capMean[p];  // finger capacitance and noise
         float capMin   = pinCapMin[p] ? pinCapMin[p] : guard * sqrtf(capVar[p]);
         float capMax   = pinCapMax[p] ? pinCapMax[p] : 30;
@@ -536,7 +638,10 @@ class TouchAdvancedUsermod : public Usermod {
         bool longTouch = millisTouch[p] > millisLongTouch || (enableAdaptiveLongTouch && (millisTouch[p] > pinLongTouch[p]));
         bool timeOut = longTouch && !longTouchLast;
 
-        // "debouncing"
+        // "debouncing" threshold filter
+        // causes debounceLen*10ms input delay and changes input behaviour
+        // touches/releases below debounceLen will not be registered
+        // high values may cause double touch to be registered as single touch, etc.
         bool touchedLast = state[p] & 0x01;    // last cycle
         if (touchedLast == (capDelta > capMin)) // logical state == button state?
           debounce[p] = 0;
@@ -547,13 +652,14 @@ class TouchAdvancedUsermod : public Usermod {
         bool transition01 = transition && !touchedLast;
         bool touchedNow = !transition != !touchedLast; //xor
         
-        // update mean, deviation, after 60s, for switch buttons in state 0 only
-        if (!pinNoMean[p] && debounce[p] == 0 && millisTouch[p] >= 10000 && (pinModex[p]!=TOUCHADV_MODE_DIGITAL_SWITCH || state[p] == 0)) {
+        // update mean, deviation, after 3s in state, for switch buttons in state 0 only
+        if (debounce[p] == 0 && millisTouch[p] >= 3000 && (pinModex[p]!=TOUCHADV_MODE_DIGITAL_SWITCH || state[p] == 0)) {
+            float k = state[p] == 0 ? 0.01f : 0.0001f;
           if (updateMean)//) && fabsf(capDelta) < 3*sqrtf(capVar[p]))
-            capMean[p] = (capMean[p] * 0.999 + cap * 0.001);
-          if (updateVariance && fabsf(capDelta) < 5*sqrtf(capVar[p]) && fabsf(cap-capMean[p]) < 5*sqrtf(capVar[p])){
-            capVar[p] = capVar[p] * 0.999 + capDelta*(cap-capMean[p]) * 0.001;
-            //capVar[p] = max(capVar[p], 0.04f);
+            capMean[p] = (capMean[p] * (1-k) + cap * k);
+          if (updateVariance && fabsf(capDelta) < 5*sqrtf(capVar[p]) && fabsf(cap-capMean[p]) < 5*sqrtf(capVar[p])) {
+            capVar[p] = capVar[p] * 0.999f + capDelta*(cap-capMean[p]) * 0.001f;
+            capVar[p] = max(capVar[p], 0.01f);
           }
         }
         
@@ -681,7 +787,7 @@ class TouchAdvancedUsermod : public Usermod {
       if (!enabled) {
         JsonArray touchArr = user.createNestedArray(FPSTR(_name));
         touchArr.add(F("disabled"));
-        //touchArr.add(F(""));
+        touchArr.add(F(""));
         return;
       } 
       if (calibrationStep<2) {
@@ -690,7 +796,7 @@ class TouchAdvancedUsermod : public Usermod {
         touchArr.add(F("..."));
         return;
       }
-      if (calibrationStep==2) {
+      if (calibrationStep>=2) {
         for (uint p=0; p<pins; p++) {
           String temp;
           temp += FPSTR(_name);
@@ -703,12 +809,11 @@ class TouchAdvancedUsermod : public Usermod {
             temp = F(" Disabled ");
           } else {
             // read - copy from update function
-            float cap      = touchPinMeasure(pin[p]);   // total capacitance in hw_cycles (equal to about 0.25pF)
+            float cap      = capLast[p];   // total capacitance in hw_cycles (equal to about 0.25pF)
             float capDelta = pinNoMean[p]   ? cap          : cap-capMean[p];
             float capMin   = pinCapMin[p]>0 ? pinCapMin[p] : guard * sqrtf(capVar[p]);
             float capMax   = pinCapMax[p]>0 ? pinCapMax[p] : 30;
             float analog   = (capDelta - capMin) / (capMax-capMin);
-
 
             if (updateMean)
               temp = F("EMA: ");
